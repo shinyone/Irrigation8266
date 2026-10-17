@@ -20,6 +20,8 @@ ESP8266WebServer server(80);
 #include "html_init.h"    // code html for initial config
 #include "html_menu.h"    // code html for menu
 #include "html_pages.h"   // code html for pages
+#include "forced_settings.h" // prefilled values
+boolean forceSettings = false;
 
 // Languages
 #ifndef MY_LANGUAGE
@@ -47,23 +49,36 @@ IPAddress apIP(192, 168, 4, 1);
 IPAddress netMsk(255, 255, 255, 0);
 DNSServer dnsServer;
 
-boolean debugging = true;
+boolean devOutput = false;
 boolean captive = false;
 boolean mqtt_config = false;
 boolean wifi_config = false;
-
-#include "forced_settings.h";
-boolean forceSettings = false;
+boolean mqtt_ever_connected = false;
 
 //Web OTA
 int uploaderror = 0;
 
-inline int32_t timeDiff(const unsigned long prev, const unsigned long next) {
-    return ((int32_t)(next - prev));
+void logDev(const String& message) {
+  if (devOutput) {
+    Serial.println(message);
+  }
 }
 
-inline long timePassedSince(unsigned long timestamp) {
-    return timeDiff(timestamp, millis());
+void logUser(const String& message) {
+  if (userOutput) {
+    File logFile = SPIFFS.open(console_file, "a");
+    logFile.println(message);
+    logFile.close();
+  }
+}
+
+void logBoth(const String& message) {
+  logDev(message);
+  logUser(message);
+}
+
+bool isNullLike(const String& value) {
+  return (value.length() == 0 || value == "null");
 }
 
 void setup() {
@@ -73,13 +88,13 @@ void setup() {
   // Mount SPIFFS filesystem
   if (SPIFFS.begin())
   {
-    if (debugging) Serial.println(F("Mounted file system"));
+    logDev(F("Mounted file system"));
   }
   else
   {
-    if (debugging) Serial.println(F("Failed to mount FS -> formating"));
+    logDev(F("Failed to mount FS -> formating"));
     SPIFFS.format();
-    if (debugging) Serial.println(F("Mounted file system after formating"));
+    logDev(F("Mounted file system after formating"));
   }
   //set led pin as output
   pinMode(blueLedPin, OUTPUT);
@@ -88,30 +103,29 @@ void setup() {
     SPIFFS.remove(console_file);
   }
 
-  Serial.println("Starting " + program_name);
-  write_log("Starting " + program_name);
+  logBoth("Starting " + program_name);
 
   // initialize defaults
   setDefaults();
 
   if (forceSettings) {
+    logBoth(F("Forcing settings"));
     saveWifi(WIFI_SSID, WIFI_PASSWORD, WIFI_HOST_NAME, OTA_PASSWORD);
     saveMqtt(MQTT_FRIENDLY_NAME, MQTT_SERVER_IP, MQTT_SERVER_PORT, MQTT_USER, MQTT_PASS, MQTT_TOPIC);
-    saveTelegram(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN);
+    saveTelegram(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, "OFF");
     saveIrrigation("V1P1", "V2P2");
-    saveOthers("ON", "homeassistant", "ON");
+    saveOthers("ON", HOME_ASSISTANT_TOPIC, "ON");
   }
 
   // load other settings 
   if (!loadOthers()) {
     // defaults if not loaded 
     others_haad = true;
-    others_haa_topic = "homeassistant";
+    others_haa_topic = HOME_ASSISTANT_TOPIC;
   }
 
   //Define default hostname
-  hostname += program_name;
-  hostname += "_" + getId();
+  hostname = program_name + "_" + getId();
   mqtt_client_id = hostname;
   WiFi.hostname(hostname.c_str());
 
@@ -130,8 +144,8 @@ void setup() {
     pinMode(irrigation_valve1, OUTPUT);
     pinMode(irrigation_valve2, OUTPUT);
   
-    digitalWrite(irrigation_valve1, HIGH);
-    digitalWrite(irrigation_valve2, HIGH);
+    setPowerStatus1(false);
+    setPowerStatus2(false);
   }
 
   if (initWifi()) {
@@ -176,25 +190,28 @@ void setup() {
     lastMqttRetry = 0;
     
     if (loadMqtt()) {
-      if (debugOutput) write_log("Starting MQTT");
+      logBoth("Starting MQTT");
 
       // heartbeat topic
       mqtt_heartbeat_topic = mqtt_topic + "/" + mqtt_fn + "/heartbeat";
 
       // home assistant topics
-      ha_command_topic = mqtt_topic + "/" + mqtt_fn + "/valve1/set";
-      ha_state_topic = mqtt_topic + "/" + mqtt_fn + "/valve1/state";
+      ha_command_topic1 = mqtt_topic + "/" + mqtt_fn + "/valve1/set";
+      ha_state_topic1 = mqtt_topic + "/" + mqtt_fn + "/valve1/state";
+      ha_command_topic2 = mqtt_topic + "/" + mqtt_fn + "/valve2/set";
+      ha_state_topic2 = mqtt_topic + "/" + mqtt_fn + "/valve2/state";
 
       if (others_haad) {
         // discovery       
-        ha_config_topic = others_haa_topic + "/switch/" + mqtt_fn + "/config";       
+        ha_config_topic1 = others_haa_topic + "/switch/" + mqtt_fn + "_valve1/config";
+        ha_config_topic2 = others_haa_topic + "/switch/" + mqtt_fn + "_valve2/config";
       }
      
       // startup mqtt connection
       initMqtt();
     }
     else {
-      write_log("Not found MQTT config go to configuration page");
+      logBoth("Not found MQTT config go to configuration page");
     }
   }
   else {
@@ -210,14 +227,11 @@ void setup() {
 void saveJson(DynamicJsonDocument& doc, const char* fileName, String configName) {
   File configFile = SPIFFS.open(fileName, "w");
   if (!configFile) {
-    if (debugging) Serial.println("Failed to open " + configName + " config file for writing");
-    if (debugOutput) write_log("Failed to open " + configName + " config file for writing");
+    logBoth("Failed to open " + configName + " config file for writing");
   }
   
-  if (debugging) Serial.println("Saving JSON");
   serializeJson(doc, configFile);
-  if (debugging) Serial.println(configName + " settings saved");
-  write_log(configName + " settings saved"); 
+  logBoth(configName + " settings saved");
   configFile.close();
 }
 
@@ -239,7 +253,7 @@ void saveMqtt(String mqttFn, String mqttHost, String mqttPort, String mqttUser,
 
 
 void saveWifi(String apSsid, String apPwd, String hostName, String otaPwd) {
-  const size_t capacity = JSON_OBJECT_SIZE(4) + 130;
+  const size_t capacity = JSON_OBJECT_SIZE(5) + 256;
   DynamicJsonDocument doc(capacity);
   doc["ap_ssid"] = apSsid;
   doc["ap_pwd"] = apPwd;
@@ -249,11 +263,12 @@ void saveWifi(String apSsid, String apPwd, String hostName, String otaPwd) {
 }
 
 
-void saveTelegram(String tci, String tbt) {
-  const size_t capacity = JSON_OBJECT_SIZE(3) + 130;
+void saveTelegram(String tci, String tbt, String verbose) {
+  const size_t capacity = JSON_OBJECT_SIZE(4) + 256;
   DynamicJsonDocument doc(capacity);
   doc["tci"] = tci;
   doc["tbt"] = tbt;
+  doc["verbose"] = verbose;
   saveJson(doc, telegram_conf, "Telegram");
 }
 
@@ -266,7 +281,7 @@ void saveIrrigation(String v1, String v2) {
 }
 
 void saveOthers(String haad, String haat, String debug) {
-  const size_t capacity = JSON_OBJECT_SIZE(3) + 130;
+  const size_t capacity = JSON_OBJECT_SIZE(4) + 256;
   DynamicJsonDocument doc(capacity);
   doc["haad"] = haad;
   doc["haat"] = haat;
@@ -277,8 +292,7 @@ void saveOthers(String haad, String haat, String debug) {
 
 // Initialize captive portal page
 void initCaptivePortal() {
-  if (debugging) Serial.println(F("Starting captive portal"));
-  write_log("Starting captive portal");
+  logBoth("Starting captive portal");
 
   server.on("/", handleInitSetup);
   server.on("/save", handleSaveWifi);
@@ -296,27 +310,27 @@ void initMqtt() {
 
 // Enable OTA only when connected as a client.
 void initOTA() {
-  //write_log("Start OTA Listener");
+  logBoth("Starting OTA Listener");
   ArduinoOTA.setHostname(hostname.c_str());
   if (ota_pwd.length() > 0) {
     ArduinoOTA.setPassword(ota_pwd.c_str());
   }
   ArduinoOTA.onStart([]() {
-    //write_log("Start");
+    logBoth("OTA Update Started");
   });
   ArduinoOTA.onEnd([]() {
-    //write_log("\nEnd");
+    logBoth("OTA Update Ended");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    //    write_log("Progress: %u%%\r", (progress / (total / 100)));
+    logBoth("OTA Update Progress: " + String(progress / (total / 100)) + "%");
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    //    write_log("Error[%u]: ", error);
-    // if (error == OTA_AUTH_ERROR) if (debugging) Serial.println(F("Auth Failed"));
-    // else if (error == OTA_BEGIN_ERROR) if (debugging) Serial.println(F("Begin Failed"));
-    // else if (error == OTA_CONNECT_ERROR) if (debugging) Serial.println(F("Connect Failed"));
-    // else if (error == OTA_RECEIVE_ERROR) if (debugging) Serial.println(F("Receive Failed"));
-    // else if (error == OTA_END_ERROR) if (debugging) Serial.println(F("End Failed"));
+    logBoth("OTA Update Error: " + String(error));
+    if (error == OTA_AUTH_ERROR) logBoth("OTA Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) logBoth("OTA Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) logBoth("OTA Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) logBoth("OTA Receive Failed");
+    else if (error == OTA_END_ERROR) logBoth("OTA End Failed");
   });
   ArduinoOTA.begin();
 }
@@ -324,54 +338,43 @@ void initOTA() {
 // LOAD
 
 DynamicJsonDocument loadJson(const char* fileName, String configName) {
-  const size_t capacity = JSON_OBJECT_SIZE(4) + 130;
+  const size_t capacity = JSON_OBJECT_SIZE(6) + 1024;
   DynamicJsonDocument doc(capacity);
   
   if (!SPIFFS.exists(fileName)) {
-    if (debugging) Serial.println(configName + " config file does not exist!");
-    if (debugOutput) write_log(configName + " config file does not exist!");      
+    logDev(configName + " config file does not exist!");   
     return doc;
   }
   File configFile = SPIFFS.open(fileName, "r");
   if (!configFile) {
-    if (debugging) Serial.println("Failed to open " + configName + " config file");
-    if (debugOutput) write_log("Failed to open " + configName + " config file");        
+    logDev("Failed to open " + configName + " config file");     
     return doc;
   }
   size_t size = configFile.size();
   if (size > 1024) {
-    if (debugging) Serial.println(configName + " config file size is too large");
-    if (debugOutput) write_log(configName + " config file size is too large");  
+    logDev(configName + " config file size is too large"); 
     return doc;
   }
 
-  if (debugging) Serial.println(configName + " config file exists.  Reading...");
+  logDev(configName + " config file exists.  Reading...");
 
-  // Allocate a buffer to store contents of the file.
-  std::unique_ptr<char[]> buf(new char[size]);
-  configFile.readBytes(buf.get(), size);
-
-  // get json document
-  DeserializationError err = deserializeJson(doc, buf.get());
+  // Parse directly from stream so strings are owned by DynamicJsonDocument.
+  DeserializationError err = deserializeJson(doc, configFile);
   if (err == DeserializationError::Ok) doc.shrinkToFit();
   else {
-      Serial.println(configName + " deserializeJson failed " + err.c_str());
-      write_log(configName + " deserializeJson failed " + err.c_str());  
+      logBoth(configName + " deserializeJson failed " + err.c_str());
   }
   configFile.close();
 
-  write_log(configName + " settings found"); 
+  logBoth(configName + " settings found");
   
   return doc;
 }
 
 bool loadWifi() {
-  ap_ssid = "";
-  ap_pwd  = "";
-
   DynamicJsonDocument doc = loadJson(wifi_conf, "Wifi");
   if (doc.isNull()) { 
-    write_log("No existing wifi settings found"); 
+    logBoth("No existing wifi settings found"); 
     return false;
   }
 
@@ -385,8 +388,7 @@ bool loadWifi() {
     ota_pwd = "";
   }
 
-  if (debugging) Serial.println("DEBUG WIFI = hostname: " + hostname + ", ap_ssid: " + ap_ssid + ", ap_pwd: " + ap_pwd + ", ota_pwd: " + ota_pwd);
-  if (debugOutput) write_log("DEBUG WIFI = hostname: " + hostname + ", ap_ssid: " + ap_ssid + ", ap_pwd: " + ap_pwd + ", ota_pwd: " + ota_pwd);
+  logBoth("DEBUG WIFI = hostname: " + hostname + ", ap_ssid: " + ap_ssid);
   
   return true;
 }
@@ -394,7 +396,7 @@ bool loadWifi() {
 bool loadMqtt() { 
   DynamicJsonDocument doc = loadJson(mqtt_conf, "MQTT");
   if (doc.isNull()) { 
-    write_log("No existing MQTT settings found"); 
+    logBoth("No existing MQTT settings found"); 
     return false;
   }
 
@@ -405,9 +407,15 @@ bool loadMqtt() {
   mqtt_password       = doc["mqtt_pwd"].as<String>();
   mqtt_topic          = doc["mqtt_topic"].as<String>();
 
+  // backward compatibility / safety defaults
+  if (isNullLike(mqtt_fn)) {
+    mqtt_fn = hostname;
+  }
+  if (isNullLike(mqtt_port)) {
+    mqtt_port = "1883";
+  }
 
-  if (debugging) Serial.println("DEBUG MQTT = Friendly Name: " + mqtt_fn + ", IP Server: " + mqtt_server + ", IP Port: " + mqtt_port + ", Username: " + mqtt_username + ", Password: " + mqtt_password + ", Topic: " + mqtt_topic);
-  if (debugOutput) write_log("DEBUG MQTT = Friendly Name: " + mqtt_fn + ", IP Server: " + mqtt_server + ", IP Port: " + mqtt_port + ", Username: " + mqtt_username + ", Password: " + mqtt_password + ", Topic: " + mqtt_topic);
+  logBoth("DEBUG MQTT = Friendly Name: " + mqtt_fn + ", IP Server: " + mqtt_server + ", IP Port: " + mqtt_port + ", Username: " + mqtt_username + ", Topic: " + mqtt_topic);
   
   mqtt_config = true;
   return true;
@@ -417,12 +425,17 @@ bool loadMqtt() {
 bool loadTelegram() {
   DynamicJsonDocument doc = loadJson(telegram_conf, "Telegram");
   if (doc.isNull()) { 
-    write_log("No existing Telegram settings found"); 
+    logBoth("No existing Telegram settings found"); 
     return false;
   }
 
   telegram_chat_id = doc["tci"].as<String>();
   telegram_bot_token = doc["tbt"].as<String>();
+  String verbose = doc["verbose"].as<String>();
+
+  telegram_verbose = (strcmp(verbose.c_str(), "ON") == 0);
+
+  logBoth("DEBUG TELEGRAM = Chat ID: " + telegram_chat_id + ", Bot Token: " + telegram_bot_token + ", Verbose: " + String(telegram_verbose));
 
   return true;
 }
@@ -431,12 +444,22 @@ bool loadTelegram() {
 bool loadIrrigation() {
   DynamicJsonDocument doc = loadJson(irrigation_conf, "Irrigation");
   if (doc.isNull()) { 
-    write_log("No existing Irrigation settings found"); 
+    logBoth("No existing Irrigation settings found"); 
     return false;
   }
   
   String v1 = doc["v1"].as<String>();
+  // Legacy 1-valve config files do not have v2.
   String v2 = doc["v2"].as<String>();
+  if (isNullLike(v1)) {
+    v1 = "V1P1";
+  }
+  if (isNullLike(v2)) {
+    v2 = "V2P2";
+  }
+
+  irrigation_valve1 = -1;
+  irrigation_valve2 = -1;
 
   if (strcmp(v1.c_str(), "V1P0") == 0) {
     irrigation_valve1 = D0;
@@ -460,41 +483,45 @@ bool loadIrrigation() {
     irrigation_valve1 = TX;
   } else if (strcmp(v1.c_str(), "V1RX") == 0) {
     irrigation_valve1 = RX;
+  } else {
+    logBoth("Invalid valve 1 config: " + v1);
   }
 
-  if (strcmp(v1.c_str(), "V2P0") == 0) {
+  if (strcmp(v2.c_str(), "V2P0") == 0) {
     irrigation_valve2 = D0;
-  } else if (strcmp(v1.c_str(), "V2P1") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P1") == 0) {
     irrigation_valve2 = D1;
-  } else if (strcmp(v1.c_str(), "V2P2") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P2") == 0) {
     irrigation_valve2 = D2;
-  } else if (strcmp(v1.c_str(), "V2P3") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P3") == 0) {
     irrigation_valve2 = D3;
-  } else if (strcmp(v1.c_str(), "V2P4") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P4") == 0) {
     irrigation_valve2 = D4;
-  } else if (strcmp(v1.c_str(), "V2P5") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P5") == 0) {
     irrigation_valve2 = D5;
-  } else if (strcmp(v1.c_str(), "V2P6") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P6") == 0) {
     irrigation_valve2 = D6;
-  } else if (strcmp(v1.c_str(), "V2P7") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P7") == 0) {
     irrigation_valve2 = D7;
-  } else if (strcmp(v1.c_str(), "V2P8") == 0) {
+  } else if (strcmp(v2.c_str(), "V2P8") == 0) {
     irrigation_valve2 = D8;
-  } else if (strcmp(v1.c_str(), "V2TX") == 0) {
+  } else if (strcmp(v2.c_str(), "V2TX") == 0) {
     irrigation_valve2 = TX;
-  } else if (strcmp(v1.c_str(), "V2RX") == 0) {
+  } else if (strcmp(v2.c_str(), "V2RX") == 0) {
     irrigation_valve2 = RX;
+  } else {
+    logBoth("Invalid valve 2 config: " + v2);
   }
 
+  logBoth("DEBUG IRRIGATION = Valve 1: " + String(irrigation_valve1) + ", Valve 2: " + String(irrigation_valve2));
   
-  return true;
+  return (irrigation_valve1 != -1 && irrigation_valve2 != -1);
 }
-
 
 bool loadOthers() {
   DynamicJsonDocument doc = loadJson(others_conf, "Others");
   if (doc.isNull()) { 
-    write_log("No existing Others settings found"); 
+    logBoth("No existing Others settings found"); 
     return false;
   }
 
@@ -502,20 +529,44 @@ bool loadOthers() {
   String haad = doc["haad"].as<String>();
   String debug = doc["debug"].as<String>();
 
-  if (strcmp(haad.c_str(), "OFF") == 0) {
-    others_haad = false;
+  // backward compatibility / safety defaults
+  if (isNullLike(others_haa_topic)) {
+    others_haa_topic = HOME_ASSISTANT_TOPIC;
   }
-  if (strcmp(debug.c_str(), "ON") == 0) {
-    debugOutput = true;
-  }
+
+  others_haad = (strcmp(haad.c_str(), "ON") == 0);
+  userOutput = (strcmp(debug.c_str(), "ON") == 0);
+
+  logBoth("DEBUG OTHERS = HAA Topic: " + others_haa_topic + ", HAAD: " + String(others_haad) + ", Debug: " + String(userOutput));
 
   return true;
 }
 
-
 void setDefaults() {
-  ap_ssid = "";
-  ap_pwd  = "";
+  ap_ssid = WIFI_SSID;
+  ap_pwd  = WIFI_PASSWORD;
+  power_status1 = false;
+  power_status2 = false;
+}
+
+void setPowerStatus1(bool powerstatus) {
+  power_status1 = powerstatus;
+  
+  if (power_status1) {
+    digitalWrite(irrigation_valve1, LOW);
+  } else {
+    digitalWrite(irrigation_valve1, HIGH);    
+  }
+}
+
+void setPowerStatus2(bool powerstatus) {
+  power_status2 = powerstatus;
+  
+  if (power_status2) {
+    digitalWrite(irrigation_valve2, LOW);
+  } else {
+    digitalWrite(irrigation_valve2, HIGH);    
+  }
 }
 
 boolean initWifi() {
@@ -528,12 +579,11 @@ boolean initWifi() {
     else
     {
       // reset hostname back to default before starting AP mode for privacy
-      hostname += program_name;
-      hostname += "_" + getId();
+      hostname = program_name + "_" + getId();
     }
   }
 
-  if (debugging) Serial.println(F("\n\r \n\rStarting in AP mode"));
+  logDev(F("\n\r \n\rStarting in AP mode"));
   WiFi.mode(WIFI_AP);
   wifi_timeout = millis() + WIFI_RETRY_INTERVAL_MS;
   WiFi.persistent(false); //fix crash esp32 https://github.com/espressif/arduino-esp32/issues/2025
@@ -547,8 +597,8 @@ boolean initWifi() {
   }
   delay(2000); // VERY IMPORTANT
   WiFi.softAPConfig(apIP, apIP, netMsk);
-  if (debugging) Serial.print(F("IP address: "));
-  if (debugging) Serial.println(WiFi.softAPIP());
+  if (devOutput) Serial.print(F("IP address: "));
+  logDev(WiFi.softAPIP().toString());
   //ticker.attach(0.2, tick); // Start LED to flash rapidly to indicate we are ready for setting up the wifi-connection (entered captive portal).
   wifi_config = false;
   return false;
@@ -617,10 +667,26 @@ void handleRoot() {
     delay(500);
     ESP.reset();
   }
+  else if (server.hasArg("REFRESH")) {  
+    if (server.hasArg("TOGGLE")) {  
+      String valveId = server.arg("TOGGLE");
+      if (valveId == "1") {
+        powerValve1Toggle();
+      } else if (valveId == "2") {
+        powerValve2Toggle();
+      }
+    }
+
+    String status = String(power_status1 ? FPSTR(txt_on) : FPSTR(txt_off));
+    status += "  ";
+    status += String(power_status2 ? FPSTR(txt_on) : FPSTR(txt_off));
+    server.send(200, F("text/html"), status);
+  }
   else {
-    String menuRootPage =  FPSTR(html_menu_root);
+    String menuRootPage = FPSTR(html_menu_root);
     menuRootPage.replace("_SHOW_LOGOUT_", (String)(login_password.length() > 0));
 
+    menuRootPage.replace("_TXT_POWER_TOGGLE_",FPSTR(txt_toggle));
     menuRootPage.replace("_TXT_SETUP_",FPSTR(txt_setup));
     menuRootPage.replace("_TXT_STATUS_",FPSTR(txt_status));
     menuRootPage.replace("_TXT_FW_UPGRADE_",FPSTR(txt_firmware_upgrade));
@@ -647,8 +713,7 @@ void handleSetup() {
   checkLogin();
   if (server.hasArg("RESET")) {
     String pageReset = FPSTR(html_page_reset);
-    String ssid = program_name;
-    ssid += "_" + getId();
+    String ssid = program_name + "_" + getId();
     pageReset.replace("_TXT_M_RESET_",FPSTR(txt_m_reset));
     pageReset.replace("_SSID_",ssid);
     sendWrappedHTML(pageReset);
@@ -684,7 +749,7 @@ void rebootAndSendPage() {
 void handleTelegram() {
   checkLogin();
   if (server.method() == HTTP_POST) {
-    saveTelegram(server.arg("tci"), server.arg("tbt"));
+    saveTelegram(server.arg("tci"), server.arg("tbt"), server.arg("verbose"));
     rebootAndSendPage();
   }
   else {
@@ -694,10 +759,20 @@ void handleTelegram() {
     telegramPage.replace("_TXT_TELEGRAM_TITLE_", FPSTR(txt_telegram_title));
     telegramPage.replace("_TXT_TELEGRAM_CHAT_ID_", FPSTR(txt_telegram_chat_id));
     telegramPage.replace("_TXT_TELEGRAM_BOT_TOKEN_", FPSTR(txt_telegram_bot_token));
+    telegramPage.replace("_TXT_TELEGRAM_VERBOSE_", FPSTR(txt_telegram_verbose));
 
     telegramPage.replace("_TELEGRAM_CHAT_ID_", telegram_chat_id);
     telegramPage.replace("_TELEGRAM_BOT_TOKEN_", telegram_bot_token);
-  
+
+    telegramPage.replace("_TXT_ON_", FPSTR(txt_on));
+    telegramPage.replace("_TXT_OFF_", FPSTR(txt_off));
+    if (telegram_verbose) {
+      telegramPage.replace("_TELEGRAM_VERBOSE_ON_", "selected");
+    }
+    else {
+      telegramPage.replace("_TELEGRAM_VERBOSE_ON_", "selected");
+    }
+
     sendWrappedHTML(telegramPage);
   }
 }
@@ -784,7 +859,7 @@ void handleIrrigation() {
 void handleOthers() {
   checkLogin();
   if (server.method() == HTTP_POST) {
-    saveOthers(server.arg("haad"), server.arg("haat"),server.arg("debug"));
+    saveOthers(server.arg("haad"), server.arg("haat"), server.arg("debug"));
     rebootAndSendPage();
   }
   else {
@@ -802,11 +877,20 @@ void handleOthers() {
     
     // read log file
     File logFile = SPIFFS.open(console_file, "r");
-    String debugLogData;   
-    while (logFile.available()){
-      debugLogData += logFile.readStringUntil('\n') + "<br>";
+    String debugLogData = "";
+    debugLogData.reserve(2048);
+    if (logFile) {
+      while (logFile.available()) {
+        if (debugLogData.length() > 1800) {
+          debugLogData += "...";
+          break;
+        }
+        debugLogData += logFile.readStringUntil('\n') + "<br>";
+      }
+      logFile.close();
+    } else {
+     debugLogData = "Failed to open log file";
     }
-    logFile.close();
     othersPage.replace("_DEBUG_CONSOLE_", debugLogData);
 
     if (others_haad) {
@@ -815,11 +899,11 @@ void handleOthers() {
     else {
       othersPage.replace("_HAAD_OFF_", "selected");
     }
-    if (debugOutput) {
-      othersPage.replace("_OTHERS_ON_", "selected");
+    if (userOutput) {
+      othersPage.replace("_DEBUG_ON_", "selected");
     }
     else {
-      othersPage.replace("_OTHERS_OFF_", "selected");
+      othersPage.replace("_DEBUG_OFF_", "selected");
     }
     
     sendWrappedHTML(othersPage);
@@ -1067,7 +1151,7 @@ void handleUploadLoop()
     if (upload.totalSize == 0)
     {
       if (upload.buf[0] != 0xE9) {
-        if (debugging) Serial.println(PSTR("Upload: File magic header does not start with 0xE9"));
+        logDev(F("Upload: File magic header does not start with 0xE9"));
         uploaderror = 3;
         return;
       }
@@ -1098,7 +1182,7 @@ void handleUploadLoop()
       return;
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    if (debugging) Serial.println(PSTR("Upload: Update was aborted"));
+    logDev(F("Upload: Update was aborted"));
     uploaderror = 7;
     Update.end();
   }
@@ -1122,46 +1206,102 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
   // ignore state
-  if (strcmp(topic, ha_state_topic.c_str()) == 0) {
+  if (strcmp(topic, ha_state_topic1.c_str()) == 0 || strcmp(topic, ha_state_topic2.c_str()) == 0) {
     return;
   }
  
-  if (debugging) {Serial.print("Received MQTT callback ["); Serial.print(topic); Serial.println("]");}
-  if (debugOutput) write_log("<CB-" + action);
-
+  if (devOutput) {Serial.print("Received MQTT callback ["); Serial.print(topic); Serial.println(F("]"));}
 
   // Receive command
-  if (strcmp(topic, ha_command_topic.c_str()) == 0) {
+  if (strcmp(topic, ha_command_topic1.c_str()) == 0) {
     if (action == "OFF") {
-      if (debugging) Serial.println(action); 
-      digitalWrite(irrigation_valve1, HIGH);
+      logDev(action);
+      setPowerStatus1(false);
     } else if (action == "ON") {
-      if (debugging) Serial.println(action); 
-      digitalWrite(irrigation_valve1, LOW); 
+      logDev(action);
+      setPowerStatus1(true);
     } else {
-      if (debugging) Serial.println("action unknown: " + action);       
+      logDev("action unknown: " + action);
     }
 
     // update home assistant state
-    mqtt_client.publish(ha_state_topic.c_str(), action.c_str());
+    mqtt_client.publish(ha_state_topic1.c_str(), action.c_str());
+
+  } else if (strcmp(topic, ha_command_topic2.c_str()) == 0) {
+    if (action == "OFF") {
+      logDev(action);
+      setPowerStatus2(false);
+    } else if (action == "ON") {
+      logDev(action);
+      setPowerStatus2(true);
+    } else {
+      logDev("action unknown: " + action);
+    }
+
+    // update home assistant state
+    mqtt_client.publish(ha_state_topic2.c_str(), action.c_str());
         
   } else {
-    if (debugging) Serial.println("topic unknown"); 
+    logDev("topic unknown");
   }
 
   irrigation_connected = true;
 }
 
+
+void powerValve1Toggle() {
+  if (power_status1) {
+    powerValve1Off();
+  } else {
+    powerValve1On();
+  }
+}
+
+void powerValve1On() {
+  setPowerStatus1(true);
+  if (mqtt_config && mqtt_client.connected()) {
+    mqtt_client.publish(ha_state_topic1.c_str(), "ON");
+  }
+}
+
+void powerValve1Off() {
+  setPowerStatus1(false);
+  if (mqtt_config && mqtt_client.connected()) {
+    mqtt_client.publish(ha_state_topic1.c_str(), "OFF");
+  }
+}
+
+void powerValve2Toggle() {
+  if (power_status2) {
+    powerValve2Off();
+  } else {
+    powerValve2On();
+  }
+}
+
+void powerValve2On() {
+  setPowerStatus2(true);
+  if (mqtt_config && mqtt_client.connected()) {
+    mqtt_client.publish(ha_state_topic2.c_str(), "ON");
+  }
+}
+
+void powerValve2Off() {
+  setPowerStatus2(false);
+  if (mqtt_config && mqtt_client.connected()) {
+    mqtt_client.publish(ha_state_topic2.c_str(), "OFF");
+  }
+}
+
 void haConfig() {
-  // send HA config packet
+  // send HA config packet for valve 1
   const size_t capacity = JSON_OBJECT_SIZE(10) + 256;
   DynamicJsonDocument haConfig(capacity);
 
-  haConfig["name"] = mqtt_fn;
-  haConfig["unique_id"] = getId();
-
-  haConfig["cmd_t"] = ha_command_topic; // command_topic
-  haConfig["stat_t"] = ha_state_topic; // state_topic
+  haConfig["name"] = mqtt_fn + " Valve 1";
+  haConfig["unique_id"] = getId() + "_valve1";
+  haConfig["cmd_t"] = ha_command_topic1; // command_topic
+  haConfig["stat_t"] = ha_state_topic1; // state_topic
   haConfig["qos"] = 1; // quality of service
   haConfig["pl_on"] = "ON"; // payload_on
   haConfig["pl_off"] = "OFF"; // payload_off
@@ -1169,7 +1309,18 @@ void haConfig() {
 
   String mqttOutput;
   serializeJson(haConfig, mqttOutput);
-  mqtt_client.beginPublish(ha_config_topic.c_str(), mqttOutput.length(), true);
+  mqtt_client.beginPublish(ha_config_topic1.c_str(), mqttOutput.length(), true);
+  mqtt_client.print(mqttOutput);
+  mqtt_client.endPublish();
+
+  // send HA config packet for valve 2
+  haConfig["name"] = mqtt_fn + " Valve 2";
+  haConfig["unique_id"] = getId() + "_valve2";
+  haConfig["cmd_t"] = ha_command_topic2;
+  haConfig["stat_t"] = ha_state_topic2;
+  mqttOutput = "";
+  serializeJson(haConfig, mqttOutput);
+  mqtt_client.beginPublish(ha_config_topic2.c_str(), mqttOutput.length(), true);
   mqtt_client.print(mqttOutput);
   mqtt_client.endPublish();
 }
@@ -1179,14 +1330,13 @@ void mqttConnect() {
   int attempts = 0;
   while (!mqtt_client.connected()) {
     // Attempt to connect
-    if (debugging) Serial.println("Attempting MQTT connection...");
+    logDev(F("Connecting to MQTT..."));
     mqtt_client.connect(mqtt_client_id.c_str(), mqtt_username.c_str(), mqtt_password.c_str());
     // If state < 0 (MQTT_CONNECTED) => network problem we retry 5 times and then waiting for MQTT_RETRY_INTERVAL_MS and retry repeatly
     if (mqtt_client.state() < MQTT_CONNECTED) {
       if (attempts == 5) {
         lastMqttRetry = millis();
-        if (debugging) Serial.print("MQTT connection problem");
-        write_log("MQTT connection problem");
+        logBoth("MQTT connection problem");
         if (telegram_connected) {
           bot->sendMessage(telegram_chat_id, program_name + ": can't connect to MQTT ", "");
         }
@@ -1203,13 +1353,16 @@ void mqttConnect() {
     }
     // We are connected
     else {
-      if (debugging) Serial.println("connected to MQTT.  Listening for topic: " + mqtt_topic);
-      write_log("Connected to MQTT.  Listening for topic: " + mqtt_topic);
+      if (!mqtt_ever_connected) {
+        mqtt_ever_connected = true;
+        logBoth("MQTT safety cutoff armed (first successful connection)");
+      }
+      logBoth("Connected to MQTT.  Listening for topic: " + mqtt_topic);
       if (telegram_connected) {
         bot->sendMessage(telegram_chat_id, program_name + ": connected to MQTT.  Listening for topic: " + mqtt_topic, "");
       }
-      String topic = mqtt_topic + "/#";
-      mqtt_client.subscribe(topic.c_str());
+      mqtt_client.subscribe(ha_command_topic1.c_str());
+      mqtt_client.subscribe(ha_command_topic2.c_str());
 
       if (others_haad) {
         haConfig();
@@ -1226,35 +1379,32 @@ bool connectWifi() {
   }
   WiFi.begin(ap_ssid.c_str(), ap_pwd.c_str());
   secured_client.setTrustAnchors(&cert); // Add root certificate for api.telegram.org
-  if (debugging) Serial.print("Connecting to " + ap_ssid);
+  if (devOutput) Serial.print("Connecting to " + ap_ssid);
   wifi_timeout = millis() + 30000;
   while (WiFi.status() != WL_CONNECTED && millis() < wifi_timeout) {
-    if (debugging) Serial.write('.');
-    //if (debugging) Serial.print(WiFi.status());
+    if (devOutput) Serial.write('.');
     // wait 500ms, flashing the blue LED to indicate WiFi connecting...
     digitalWrite(blueLedPin, LOW);
     delay(250);
     digitalWrite(blueLedPin, HIGH);
     delay(250);
   }
-  if (debugging) Serial.println("");
+  logDev(F(""));
   if (WiFi.status() != WL_CONNECTED) {
-    if (debugging) Serial.println(F("Failed to connect to wifi"));
+    logDev(F("Failed to connect to wifi"));
     return false;
   }
-  if (debugging) Serial.println("Connected to " + ap_ssid);
 
   while (WiFi.localIP().toString() == "0.0.0.0" || WiFi.localIP().toString() == "") {
-    if (debugging) Serial.write('.');
+    if (devOutput) Serial.write('.');
     delay(500);
   }
   if (WiFi.localIP().toString() == "0.0.0.0" || WiFi.localIP().toString() == "") {
-    if (debugging) Serial.println(F("Failed to get IP address"));
+    logDev(F("Failed to get IP address"));
     return false;
   }
   
-  if (debugging) Serial.print("WiFi connected. IP address: "); Serial.println(WiFi.localIP());
-  write_log("WiFi connected.");
+  logBoth("WiFi connected: " + WiFi.localIP().toString());
 
   //keep LED off (For Wemos D1-Mini)
   digitalWrite(blueLedPin, HIGH);
@@ -1300,34 +1450,95 @@ void checkLogin() {
 void loop() {
   server.handleClient();
   ArduinoOTA.handle();
+
+  int wifiStatus = WiFi.status();
+  bool wifiStaMode = (WiFi.getMode() == WIFI_STA);
+  static bool wifiSafetyTriggered = false;
   
   //reset board to attempt to connect to wifi again if in ap mode or wifi dropped out and time limit passed
-  if (WiFi.getMode() == WIFI_STA and WiFi.status() == WL_CONNECTED) {
+  if (wifiStaMode and wifiStatus == WL_CONNECTED) {
     wifi_timeout = millis() + WIFI_RETRY_INTERVAL_MS;
+    if (wifiSafetyTriggered) {
+      logBoth("WiFi reconnected");
+      wifiSafetyTriggered = false;
+    }
   } else if (wifi_config_exists and millis() > wifi_timeout) {
     ESP.restart();
+  }
+
+  // Always enforce valve cutoff when WiFi client mode loses connection.
+  if (wifiStaMode and wifiStatus != WL_CONNECTED) {
+    if (!wifiSafetyTriggered) {
+      logBoth("WiFi disconnected: safety cutoff applied");
+      wifiSafetyTriggered = true;
+    }
+    setPowerStatus1(false);
+    setPowerStatus2(false);
   }
   
   if (!captive) {
     if (mqtt_config) {
+      static int lastMqttState = MQTT_CONNECTED;
+      int mqttState = mqtt_client.state();
+      bool mqttStateChanged = (mqttState != lastMqttState);
+
       //MQTT failed retry to connect
-      if (mqtt_client.state() < MQTT_CONNECTED)
+      if (mqttState < MQTT_CONNECTED)
       {
+        if (mqttStateChanged) {
+          logDev("MQTT state changed to " + String(mqttState));
+          lastMqttState = mqttState;
+        }
+
+        // Before first successful MQTT connection, allow standalone manual mode.
+        // After first successful MQTT connection, any MQTT disconnect forces valves off.
+        if (mqtt_ever_connected) {
+          if (mqttStateChanged) {
+            logDev("MQTT disconnected after successful connection: safety cutoff applied");
+          }
+          setPowerStatus1(false);
+          setPowerStatus2(false);
+        }
+
         if ((millis() > (lastMqttRetry + MQTT_RETRY_INTERVAL_MS)) or lastMqttRetry == 0) {
-        mqttConnect();
+          mqttConnect();
         }
       }
-      //MQTT config problem on MQTT do nothing
-      else if (mqtt_client.state() > MQTT_CONNECTED ) return;
+      // MQTT config/auth problem: standalone mode allowed before first MQTT success.
+      // If MQTT had connected in this boot, treat this as a safety event.
+      else if (mqttState > MQTT_CONNECTED ) {
+        if (mqttStateChanged) {
+          logDev("MQTT state changed to " + String(mqttState) + " (config/auth problem)");
+          lastMqttState = mqttState;
+        }
+
+        if (mqtt_ever_connected) {
+          if (mqttStateChanged) {
+            logDev("MQTT failure after successful connection: safety cutoff applied");
+          }
+          setPowerStatus1(false);
+          setPowerStatus2(false);
+        }
+
+        return;
+      }
       //MQTT connected send status
       else {
+        if (mqttStateChanged) {
+          logDev("MQTT connected");
+          lastMqttState = mqttState;
+        }
+        if (!mqtt_ever_connected) {
+          mqtt_ever_connected = true;
+          logBoth("MQTT safety cutoff armed (first successful connection)");
+        }
         mqtt_client.loop();  
 
         // send our heartbeat
-        if (timeDiff(lastHeartbeatSent, millis()) > HEARTBEAT_SEND_INTERVAL_MS) {
+        if ((millis() - lastHeartbeatSent) > HEARTBEAT_SEND_INTERVAL_MS) {
             lastHeartbeatSent = millis();
-            if (debugging) Serial.println("Sending heartbeat. On: " + mqtt_heartbeat_topic);
-            if (debugOutput) write_log("HB>");
+            logDev("Sending heartbeat. On: " + mqtt_heartbeat_topic);
+            // if (userOutput) write_log("HB>");
             mqtt_client.publish(mqtt_heartbeat_topic.c_str(), mqtt_heartbeat.c_str());
         }   
       }

@@ -23,7 +23,7 @@ const char txt_login[] PROGMEM = "LOGIN";
 const char txt_on[] PROGMEM = "ON";
 const char txt_off[] PROGMEM = "OFF";
 
-//Page Reboot, save & Resseting
+//Page Reboot, save & Reseting
 const char txt_m_reboot[] PROGMEM = "Rebooting... Refresh in";
 const char txt_m_reset[] PROGMEM = "Resetting... Connect to SSID";
 const char txt_m_save[] PROGMEM = "Saving configuration and rebooting... Refresh in";
@@ -41,10 +41,12 @@ const char txt_mqtt_topic[] PROGMEM = "Topic";
 const char txt_telegram_title[] PROGMEM = "Telegram Parameters";
 const char txt_telegram_chat_id[] PROGMEM = "Chat ID";
 const char txt_telegram_bot_token[] PROGMEM = "Bot Token";
+const char txt_telegram_verbose[] PROGMEM = "Verbose";
 
 //Page Irrigation
 const char txt_irrigation_title[] PROGMEM = "Irrigation Parameters";
 const char txt_irrigation_valve1[] PROGMEM = "Valve 1 pin";
+const char txt_irrigation_valve2[] PROGMEM = "Valve 2 pin";
 
 const char txt_irrigation_pin0[] PROGMEM = "Pin 0";
 const char txt_irrigation_pin1[] PROGMEM = "Pin 1";

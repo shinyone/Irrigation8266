@@ -10,7 +10,8 @@ const char html_menu_root[] PROGMEM = R"====(
 </div>
 <table style="width:100%">
     <tr>
-      <td style="width:100%"><button onclick="refresh('&TOGGLE=1');">_TXT_POWER_TOGGLE_</button></td>
+        <td style="width:50%"><button onclick="refresh('&TOGGLE=1');">_TXT_POWER_TOGGLE_</button></td>
+        <td style="width:50%"><button onclick="refresh('&TOGGLE=2');">_TXT_POWER_TOGGLE_</button></td>
     </tr>
 </table>
 <div>

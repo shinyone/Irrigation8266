@@ -97,21 +97,20 @@ void setup() {
     if (debugging) Serial.println(F("Forcing settings"));
     saveWifi(WIFI_SSID, WIFI_PASSWORD, WIFI_HOST_NAME, OTA_PASSWORD);
     saveMqtt(MQTT_FRIENDLY_NAME, MQTT_SERVER_IP, MQTT_SERVER_PORT, MQTT_USER, MQTT_PASS, MQTT_TOPIC);
-    saveTelegram(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN);
+    saveTelegram(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, "OFF");
     saveIrrigation("V1P1");
-    saveOthers(ON, HOME_ASSISTANT_TOPIC, ON);
+    saveOthers("ON", HOME_ASSISTANT_TOPIC, "ON");
   }
   
   // load other settings 
   if (!loadOthers()) {
     // defaults if not loaded 
     others_haad = true;
-    others_haa_topic = "homeassistant";
+    others_haa_topic = HOME_ASSISTANT_TOPIC;
   }
 
   //Define default hostname
-  hostname += program_name;
-  hostname += "_" + getId();
+  hostname = program_name + "_" + getId();
   mqtt_client_id = hostname;
   WiFi.hostname(hostname.c_str());
 
@@ -128,8 +127,7 @@ void setup() {
   irrigation_connected = false;
   if (loadIrrigation()) {
     pinMode(irrigation_valve1, OUTPUT);
-    digitalWrite(irrigation_valve1, HIGH);
-    power_status = false;
+    setPowerStatus(false);
   }
 
   if (initWifi()) {
@@ -247,11 +245,12 @@ void saveWifi(String apSsid, String apPwd, String hostName, String otaPwd) {
 }
 
 
-void saveTelegram(String tci, String tbt) {
-  const size_t capacity = JSON_OBJECT_SIZE(3) + 256;
+void saveTelegram(String tci, String tbt, String verbose) {
+  const size_t capacity = JSON_OBJECT_SIZE(4) + 256;
   DynamicJsonDocument doc(capacity);
   doc["tci"] = tci;
   doc["tbt"] = tbt;
+  doc["verbose"] = verbose;
   saveJson(doc, telegram_conf, "Telegram");
 }
 
@@ -407,6 +406,9 @@ bool loadTelegram() {
 
   telegram_chat_id = doc["tci"].as<String>();
   telegram_bot_token = doc["tbt"].as<String>();
+  String verbose = doc["verbose"].as<String>();
+
+  telegram_verbose = (strcmp(verbose.c_str(), "ON") == 0);
 
   return true;
 }
@@ -420,6 +422,7 @@ bool loadIrrigation() {
   }
   
   String v1 = doc["v1"].as<String>();
+    irrigation_valve1 = -1;
 
   if (strcmp(v1.c_str(), "V1P0") == 0) {
     irrigation_valve1 = D0;
@@ -443,11 +446,14 @@ bool loadIrrigation() {
     irrigation_valve1 = TX;
   } else if (strcmp(v1.c_str(), "V1RX") == 0) {
     irrigation_valve1 = RX;
+  } else {
+    write_log("Invalid valve 1 config: " + v1);
+    return false;
+  }
   }
   
   return true;
 }
-
 
 bool loadOthers() {
   DynamicJsonDocument doc = loadJson(others_conf, "Others");
@@ -466,12 +472,22 @@ bool loadOthers() {
   return true;
 }
 
-
 void setDefaults() {
   ap_ssid = WIFI_SSID;
   ap_pwd  = WIFI_PASSWORD;
-  power_status = false;
+  power_status1 = false;
 }
+
+void setPowerStatus(bool powerstatus) {
+  power_status1 = powerstatus;
+  
+  if (power_status1) {
+    digitalWrite(irrigation_valve1, HIGH);
+  } else {
+    digitalWrite(irrigation_valve1, LOW);    
+  }
+}
+
 
 boolean initWifi() {
   bool connectWifiSuccess = true;
@@ -577,7 +593,7 @@ void handleRoot() {
       powerValve1Toggle();
     }
 
-    server.send(200, F("text/html"), power_status ? FPSTR(txt_on) : FPSTR(txt_off));
+    server.send(200, F("text/html"), power_status1 ? FPSTR(txt_on) : FPSTR(txt_off));
   }
   else {
     String menuRootPage = FPSTR(html_menu_root);
@@ -610,8 +626,7 @@ void handleSetup() {
   checkLogin();
   if (server.hasArg("RESET")) {
     String pageReset = FPSTR(html_page_reset);
-    String ssid = program_name;
-    ssid += "_" + getId();
+    String ssid = program_name + "_" + getId();
     pageReset.replace("_TXT_M_RESET_",FPSTR(txt_m_reset));
     pageReset.replace("_SSID_",ssid);
     sendWrappedHTML(pageReset);
@@ -647,7 +662,7 @@ void rebootAndSendPage() {
 void handleTelegram() {
   checkLogin();
   if (server.method() == HTTP_POST) {
-    saveTelegram(server.arg("tci"), server.arg("tbt"));
+    saveTelegram(server.arg("tci"), server.arg("tbt"), server.arg("verbose"));
     rebootAndSendPage();
   }
   else {
@@ -657,10 +672,18 @@ void handleTelegram() {
     telegramPage.replace("_TXT_TELEGRAM_TITLE_", FPSTR(txt_telegram_title));
     telegramPage.replace("_TXT_TELEGRAM_CHAT_ID_", FPSTR(txt_telegram_chat_id));
     telegramPage.replace("_TXT_TELEGRAM_BOT_TOKEN_", FPSTR(txt_telegram_bot_token));
+    telegramPage.replace("_TXT_TELEGRAM_VERBOSE_", FPSTR(txt_telegram_verbose));
 
     telegramPage.replace("_TELEGRAM_CHAT_ID_", telegram_chat_id);
     telegramPage.replace("_TELEGRAM_BOT_TOKEN_", telegram_bot_token);
   
+    if (telegram_verbose) {
+      telegramPage.replace("_TELEGRAM_VERBOSE_ON_", "selected");
+    }
+    else {
+      telegramPage.replace("_TELEGRAM_VERBOSE_ON_", "selected");
+    }
+
     sendWrappedHTML(telegramPage);
   }
 }
@@ -1072,12 +1095,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, ha_command_topic.c_str()) == 0) {
     if (action == "OFF") {
       if (debugging) Serial.println(action); 
-      power_status = false;
-      digitalWrite(irrigation_valve1, HIGH);
+      setPowerStatus(false);
     } else if (action == "ON") {
       if (debugging) Serial.println(action); 
-      power_status = true;
-      digitalWrite(irrigation_valve1, LOW);
+      setPowerStatus(true);
     } else {
       if (debugging) Serial.println("action unknown: " + action);       
     }
@@ -1094,7 +1115,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 
 void powerValve1Toggle() {
-  if (power_status) {
+  if (power_status1) {
     powerValve1Off();
   } else {
     powerValve1On();
@@ -1274,11 +1295,15 @@ void loop() {
       if (mqtt_client.state() < MQTT_CONNECTED)
       {
         if ((millis() > (lastMqttRetry + MQTT_RETRY_INTERVAL_MS)) or lastMqttRetry == 0) {
-        mqttConnect();
+          setPowerStatus(false);
+          mqttConnect();
         }
       }
       //MQTT config problem on MQTT do nothing
-      else if (mqtt_client.state() > MQTT_CONNECTED ) return;
+      else if (mqtt_client.state() > MQTT_CONNECTED ) {
+        setPowerStatus(false);
+        return;
+      }
       //MQTT connected send status
       else {
         mqtt_client.loop();  

@@ -1,6 +1,6 @@
 //#define MY_LANGUAGE fr-FR // define your language
 
-const String program_version = "0.0.1";
+const String program_version = "0.0.3";
 const String program_name = "Irrigation";
 
 //Define global variables for files
@@ -16,11 +16,12 @@ const PROGMEM uint8_t blueLedPin = LED_BUILTIN; // Onboard LED = digital pin 2 "
 const PROGMEM uint8_t redLedPin = 0;
 
 // current device setting
-bool power_status; // true for on
+bool power_status1; // true for on
+bool power_status2; // true for on
 
 // Define global variables for network
 const PROGMEM uint32_t WIFI_RETRY_INTERVAL_MS = 300000;
-int wifi_timeout;
+uint32_t wifi_timeout;
 bool wifi_config_exists;
 String hostname = "";
 String ap_ssid;
@@ -42,20 +43,25 @@ String mqtt_heartbeat_topic;
 bool telegram_connected;
 String telegram_chat_id;
 String telegram_bot_token;
+bool telegram_verbose = false;
 
 // Define global variables for Irrigation
 bool irrigation_connected;
 int irrigation_valve1;
+int irrigation_valve2;
 
 //Define global variables for Others settings
 bool others_haad;
 String others_haa_topic;
-bool debugOutput = false;
+bool userOutput = false;
 
 // Define global variables for HA topics
-String ha_command_topic;
-String ha_state_topic;
-String ha_config_topic;
+String ha_command_topic1;
+String ha_state_topic1;
+String ha_config_topic1;
+String ha_command_topic2;
+String ha_state_topic2;
+String ha_config_topic2;
 
 //login
 String login_username = "admin";
